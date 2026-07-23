@@ -547,6 +547,9 @@ class ClaudeAccountSwitcher:
         key = (self._read_json(get_global_config_path()) or {}).get("primaryApiKey")
         return key if isinstance(key, str) else ""
 
+    def _read_default_profile_credentials(self) -> ActiveCredentials:
+        return self._store._read_default_profile_credentials()
+
     def _write_credentials(self, credentials: str) -> None:
         self._store._write_credentials(credentials)
 
@@ -701,6 +704,13 @@ class ClaudeAccountSwitcher:
             os.chmod(config_file, 0o600)
 
     # -- public accessors for session mode (claude_swap.session) ---------
+
+    def recover(self, identifier: str) -> dict:
+        """Ask the credential-owning Claude profile to refresh an expired token."""
+        from claude_swap.recovery import recover_account
+
+        account_num, email, org_uuid = self.resolve_account(identifier)
+        return recover_account(self, account_num, email, org_uuid)
 
     def resolve_account(self, identifier: str) -> tuple[str, str, str]:
         """Resolve NUM|EMAIL to (account_num, email, organizationUuid).
