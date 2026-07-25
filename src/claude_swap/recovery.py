@@ -87,6 +87,12 @@ _WINDOWS_ENV_ALLOWLIST = frozenset({
 class _UsageStore(Protocol):
     def entries(self, identities: dict[str, tuple[str, str]], models=()): ...
 
+    def clear_dead_token(
+        self,
+        nums: list[str],
+        identities: dict[str, tuple[str, str]],
+    ) -> None: ...
+
 
 class _Switcher(Protocol):
     backup_dir: Path
@@ -157,7 +163,11 @@ def _find_owner(
     email: str,
     org_uuid: str,
 ) -> tuple[_Owner | None, RecoveryStatus | None]:
-    """Return the one live profile allowed to own recovery, failing closed."""
+    """Return the one profile allowed to own recovery, failing closed.
+
+    A matching inactive session profile remains Claude-owned while idle; the
+    recovery canary itself becomes its bounded native credential owner.
+    """
     try:
         default_sessions, default_ides = get_running_instances(
             get_default_claude_config_home()
@@ -171,12 +181,17 @@ def _find_owner(
 
         session_dir = session_dir_for(switcher.backup_dir, account_num, email)
         session_live = bool(live_sessions_for(session_dir))
-        session_identity = read_session_identity(session_dir) if session_live else None
+        session_present = session_live or session_dir.is_dir()
+        session_identity = (
+            read_session_identity(session_dir) if session_present else None
+        )
     except Exception:
         return None, "retry_later"
 
     # A live profile with unreadable identity cannot be safely attributed.
     if default_live and default_identity is None:
+        return None, "human_required"
+    if session_present and session_identity is None:
         return None, "human_required"
     if session_live and not _same_identity(session_identity, email, org_uuid):
         return None, "human_required"
@@ -184,7 +199,7 @@ def _find_owner(
     candidates: list[_Owner] = []
     if default_live and _same_identity(default_identity, email, org_uuid):
         candidates.append(_Owner("default", None))
-    if session_live:
+    if session_present and _same_identity(session_identity, email, org_uuid):
         candidates.append(_Owner("session", session_dir))
 
     if len(candidates) != 1:
@@ -523,16 +538,25 @@ def _recover(
     org_uuid: str,
 ) -> RecoveryStatus:
     identity = {account_num: (email, org_uuid or "")}
-    # Keep a known-dead credential out of Claude Code even if it is still in a
-    # live owner profile. This is a cache read only; recovery never observes or
-    # writes usage because that bypasses the collector's claim/fencing protocol.
-    if switcher._usage_store.entries(identity)[account_num].token_dead():
-        return "human_required"
+    token_dead = switcher._usage_store.entries(identity)[account_num].token_dead()
+    if token_dead:
+        # invalid_grant is recorded by the usage collector for the slot backup.
+        # Once a matching session profile exists, that backup can be a consumed
+        # generation while the Claude-owned session lineage remains recoverable.
+        owner, owner_status = _find_owner(
+            switcher, account_num, email, org_uuid
+        )
+        if owner is None:
+            return owner_status or "human_required"
+        if owner.kind != "session":
+            return "human_required"
 
     before, status = _snapshot_owner(switcher, account_num, email, org_uuid)
     if before is None:
         return status or "human_required"
     if before.credential_state != "expired":
+        if token_dead and before.credential_state == "not_needed":
+            switcher._usage_store.clear_dead_token([account_num], identity)
         return before.credential_state
 
     # Re-read immediately before Popen. The command lock serializes recoveries
@@ -568,6 +592,10 @@ def _recover(
         return "human_required"
     if after.credential_state != "not_needed":
         return "retry_later"
+    if token_dead:
+        # This clears only backup-derived failure/quarantine state. The fresh
+        # usage observation remains collector-owned and follows its claim path.
+        switcher._usage_store.clear_dead_token([account_num], identity)
     return "recovered"
 
 
