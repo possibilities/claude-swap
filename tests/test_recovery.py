@@ -285,7 +285,14 @@ class TestCanary:
         assert kwargs["stdin"] is subprocess.DEVNULL
         assert kwargs["stdout"] is subprocess.DEVNULL
         assert kwargs["stderr"] is subprocess.DEVNULL
-        assert kwargs["start_new_session"] is True
+        if recovery.sys.platform == "win32":
+            assert kwargs["creationflags"] == getattr(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200
+            )
+            assert "start_new_session" not in kwargs
+        else:
+            assert kwargs["start_new_session"] is True
+            assert "creationflags" not in kwargs
         assert "CLAUDE_CONFIG_DIR" not in kwargs["env"]
         assert "ANTHROPIC_API_KEY" not in kwargs["env"]
         assert "CLAUDE_CODE_OAUTH_TOKEN" not in kwargs["env"]
@@ -310,6 +317,9 @@ class TestCanary:
         assert recovery.run_canary(profile) == "exited"
         assert seen["kwargs"]["env"]["CLAUDE_CONFIG_DIR"] == str(profile)
 
+    @pytest.mark.skipif(
+        recovery.sys.platform == "win32", reason="POSIX process-group signals"
+    )
     def test_timeout_terms_then_kills_posix_group(self, monkeypatch):
         class Hung(self.Process):
             def __init__(self):
@@ -336,6 +346,9 @@ class TestCanary:
         assert recovery.run_canary(None) == "timed_out"
         assert signals == [(4321, signal.SIGTERM), (4321, signal.SIGKILL)]
 
+    @pytest.mark.skipif(
+        recovery.sys.platform == "win32", reason="POSIX signal guard"
+    )
     def test_sigterm_cleans_tree_and_restores_handlers(self, monkeypatch):
         class Running(self.Process):
             def wait(self, timeout=None):
