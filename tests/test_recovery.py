@@ -39,12 +39,17 @@ def credentials(*, expired: bool, refresh: bool = True, scopes=None) -> str:
 class FakeStore:
     def __init__(self, *, dead: bool = False):
         self.dead = dead
+        self.cleared: list[tuple[list[str], dict]] = []
 
     def entries(self, identities, models=()):
         return {
             num: SimpleNamespace(token_dead=lambda: self.dead)
             for num in identities
         }
+
+    def clear_dead_token(self, nums, identities):
+        self.dead = False
+        self.cleared.append((list(nums), identities))
 
 
 class FakeSwitcher:
@@ -162,8 +167,6 @@ class TestOwnerSelection:
         )
         assert status is None
 
-<<<<<<< HEAD
-=======
     def test_idle_session_profile_can_own_bounded_recovery(self, monkeypatch):
         switcher = FakeSwitcher()
         session_dir = (
@@ -186,7 +189,6 @@ class TestOwnerSelection:
         assert owner == recovery._Owner("session", session_dir)
         assert status is None
 
->>>>>>> c915be4 (fixup! feat(auth): recover owner-held expired tokens)
     @pytest.mark.parametrize(
         ("default_identity", "default_live", "session_live", "session_identity"),
         [
@@ -526,18 +528,56 @@ class TestRecoverAccount:
         assert result["recoveryStatus"] == "not_needed"
         canary.assert_not_called()
 
-    def test_dead_token_quarantine_is_never_canaried(self, monkeypatch):
+    def test_dead_default_token_quarantine_is_never_canaried(self, monkeypatch):
         switcher = FakeSwitcher([credentials(expired=True)], dead=True)
-        owner = Mock()
+        default_owner(monkeypatch)
         canary = Mock()
-        monkeypatch.setattr(recovery, "_find_owner", owner)
         monkeypatch.setattr(recovery, "run_canary", canary)
 
         result = recovery.recover_account(switcher, ACCOUNT, EMAIL, ORG)
 
         assert result["recoveryStatus"] == "human_required"
-        owner.assert_not_called()
         canary.assert_not_called()
+
+    def test_dead_token_owner_probe_preserves_retry_later(self, monkeypatch):
+        switcher = FakeSwitcher(dead=True)
+        monkeypatch.setattr(
+            recovery, "_find_owner", lambda *_args: (None, "retry_later")
+        )
+
+        result = recovery.recover_account(switcher, ACCOUNT, EMAIL, ORG)
+
+        assert result["recoveryStatus"] == "retry_later"
+
+    def test_backup_dead_session_owner_recovers_and_clears_quarantine(
+        self, monkeypatch, tmp_path
+    ):
+        switcher = FakeSwitcher(dead=True)
+        owner = recovery._Owner("session", tmp_path / "session")
+        values = iter([
+            credentials(expired=True),
+            credentials(expired=True),
+            credentials(expired=False),
+        ])
+        monkeypatch.setattr(
+            recovery, "_find_owner", lambda *_args: (owner, None)
+        )
+        monkeypatch.setattr(
+            recovery, "read_session_identity", lambda _dir: (EMAIL, ORG)
+        )
+        monkeypatch.setattr(
+            recovery,
+            "read_session_owner_credentials",
+            lambda _dir: ActiveCredentials(next(values), False),
+        )
+        monkeypatch.setattr(recovery, "run_canary", lambda _dir: "exited")
+
+        result = recovery.recover_account(switcher, ACCOUNT, EMAIL, ORG)
+
+        assert result["recoveryStatus"] == "recovered"
+        assert switcher._usage_store.cleared == [
+            ([ACCOUNT], {ACCOUNT: (EMAIL, ORG)})
+        ]
 
     def test_no_owner_is_human_required(self, monkeypatch):
         switcher = FakeSwitcher([credentials(expired=True)])
