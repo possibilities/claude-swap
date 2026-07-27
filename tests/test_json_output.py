@@ -187,6 +187,10 @@ class TestJsonHelpers:
 
     @pytest.mark.parametrize("credentials", [
         "not-json",
+        "null",
+        "[]",
+        '"text"',
+        "123",
         json.dumps({"apiKey": "sk-ant-api-key"}),
         json.dumps({"claudeAiOauth": []}),
         json.dumps({"claudeAiOauth": {"subscriptionType": "PRO", "rateLimitTier": 5}}),
