@@ -299,14 +299,16 @@ class TestCanary:
         assert "ANTHROPIC_BASE_URL" not in kwargs["env"]
         assert kwargs["env"]["HOME"] == str(tmp_path / "home")
         assert kwargs["env"]["PATH"] == "/sealed/bin"
+        assert kwargs["env"]["AGENTSURFACE_LAUNCH"] == "1"
+        injected = {"AGENTSURFACE_LAUNCH"}
         if recovery.sys.platform == "win32":
             assert "USER" not in kwargs["env"]
             assert "LOGNAME" not in kwargs["env"]
-            assert set(kwargs["env"]) <= recovery._WINDOWS_ENV_ALLOWLIST
+            assert set(kwargs["env"]) <= recovery._WINDOWS_ENV_ALLOWLIST | injected
         else:
             assert kwargs["env"]["USER"] == "keychain-owner"
             assert kwargs["env"]["LOGNAME"] == "keychain-owner"
-            assert set(kwargs["env"]) <= recovery._POSIX_ENV_ALLOWLIST
+            assert set(kwargs["env"]) <= recovery._POSIX_ENV_ALLOWLIST | injected
         assert not Path(kwargs["cwd"]).exists()
 
     def test_session_env_sets_only_exact_profile(self, monkeypatch, tmp_path):
