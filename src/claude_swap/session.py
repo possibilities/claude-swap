@@ -651,6 +651,10 @@ class SessionManager:
             k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
         }
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
+        # Already-routed sentinel (agentsurface ADR 0004): with balancing
+        # shims on PATH, the ``claude`` we exec must be the real binary —
+        # a manual ``cswap run N`` means slot N, never a re-balance.
+        env["AGENTSURFACE_LAUNCH"] = "1"
         self._exec(claude_bin, claude_args, env=env)
 
     def _ensure_shared_resume_visible(
