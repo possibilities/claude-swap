@@ -269,6 +269,10 @@ def _canary_environment(config_dir: Path | None) -> dict[str, str]:
         env.pop("CLAUDE_CONFIG_DIR", None)
     else:
         env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    # Already-routed sentinel (agentsurface ADR 0004): the canary must run
+    # the real claude binary against the owner profile — a balancing shim
+    # re-routing it would probe the wrong account entirely.
+    env["AGENTSURFACE_LAUNCH"] = "1"
     return env
 
 
