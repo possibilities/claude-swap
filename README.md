@@ -1,10 +1,22 @@
 # claude-swap
 
+[![CI](https://github.com/possibilities/claude-swap/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/possibilities/claude-swap/actions/workflows/ci.yml)
+
 Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out, or let it switch for you before you hit a rate limit. Track usage for every account in a live dashboard, and run accounts in parallel. Works with both the Claude Code CLI and the VS Code extension.
+
+This repository is the public `possibilities` integration fork. Its `main`
+tracks upstream and also carries the capacity metadata and expired-token
+recovery contracts consumed by
+[`agentusage`](https://github.com/possibilities/agentusage). Install this fork
+explicitly when you need those contracts:
+
+```bash
+uv tool install --force 'git+https://github.com/possibilities/claude-swap.git@main'
+```
 
 ## Installation
 
-### Using uv (recommended)
+### Upstream release using uv (recommended for general use)
 
 ```bash
 uv tool install claude-swap
@@ -19,7 +31,7 @@ pipx install claude-swap
 ### From source
 
 ```bash
-git clone https://github.com/realiti4/claude-swap.git
+git clone https://github.com/possibilities/claude-swap.git
 cd claude-swap
 uv sync
 uv run cswap help
@@ -33,6 +45,9 @@ cswap upgrade          # uv/pipx installs on macOS/Linux: auto-detects and upgra
 uv tool upgrade claude-swap
 pipx upgrade claude-swap
 ```
+
+For an installation from this fork, rerun the explicit `git+https` install
+command above so the source remains unambiguous.
 
 ## Usage
 
