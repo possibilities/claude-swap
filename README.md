@@ -133,6 +133,7 @@ Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP ser
 <summary>Sharing details — MCP servers & chat history</summary>
 
 - With `--share-history`, a session started under one account shows up in `--resume` under the others, and nothing already saved is lost.
+- If another Claude is still using a profile that has per-account history, the one-time merge is deferred until that profile is idle. An exact `--resume <session-id>` that exists only in the not-yet-shared default history is refused with a retry hint instead of launching Claude where it would misleadingly report that the conversation does not exist.
 - User-scope MCP servers (`claude mcp add -s user`) are mirrored from your default profile on every launch — manage them there; changes made inside a session don't persist. Definitions are copied as-is (including inline `env`/`headers` values), but MCP OAuth logins are not — HTTP servers may ask you to authenticate once per profile via `/mcp`.
 - `--no-share` turns sharing off and removes the mirrored MCP config (profiles that never mirrored are left alone).
 

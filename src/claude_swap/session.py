@@ -45,6 +45,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
@@ -469,6 +470,54 @@ def profile_is_quiescent(session_dir: Path) -> bool:
     return not sessions and unreadable == 0
 
 
+def _exact_resume_session_id(claude_args: list[str]) -> str | None:
+    """The canonical UUID from an exact ``--resume`` request, if any.
+
+    Bare ``--resume`` opens Claude's picker, and non-UUID values may be search
+    text or a claude.ai/code URL. Those are native Claude behavior and are not
+    precise enough for cswap to make a transcript-visibility claim about.
+    """
+    value: str | None = None
+    for index, arg in enumerate(claude_args):
+        if arg in ("--resume", "-r"):
+            if (
+                index + 1 < len(claude_args)
+                and not claude_args[index + 1].startswith("-")
+            ):
+                value = claude_args[index + 1]
+            break
+        if arg.startswith("--resume=") or arg.startswith("-r="):
+            value = arg.split("=", 1)[1]
+            break
+    if not value:
+        return None
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        return None
+
+
+def _transcript_visibility(projects_dir: Path, session_id: str) -> bool | None:
+    """Whether a Claude projects store contains ``session_id``.
+
+    ``None`` means the store could not be inspected. Callers use that third
+    state to fail open: an unreadable directory is not evidence that a
+    transcript is absent.
+    """
+    try:
+        if not projects_dir.exists():
+            return False
+        if not projects_dir.is_dir():
+            return None
+        filename = f"{session_id}.jsonl"
+        for project_dir in projects_dir.iterdir():
+            if project_dir.is_dir() and (project_dir / filename).is_file():
+                return True
+        return False
+    except OSError:
+        return None
+
+
 def _mkdir_private(path: Path) -> None:
     """mkdir -p with 0o700 on every created level.
 
@@ -560,6 +609,10 @@ class SessionManager:
         session_dir, account_num, email = self.setup_session(
             identifier, share, share_history
         )
+        if share_history:
+            self._ensure_shared_resume_visible(
+                claude_args, session_dir, account_num, email
+            )
 
         print(
             f"{accent('Launching')} Account-{account_num} ({email}) "
@@ -570,6 +623,69 @@ class SessionManager:
         }
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
         self._exec(claude_bin, claude_args, env=env)
+
+    def _ensure_shared_resume_visible(
+        self,
+        claude_args: list[str],
+        session_dir: Path,
+        account_num: str,
+        email: str,
+    ) -> None:
+        """Refuse an exact resume that deferred history sharing would strand.
+
+        A profile with real per-account history cannot be merged into the
+        default store while another Claude owns it. ``_sync_sharing`` safely
+        defers that migration, but an exact resume may name a conversation
+        which exists only in the still-hidden default store. Launching Claude
+        in that state can only produce its misleading "No conversation found"
+        error. Refuse before exec instead; ordinary launches and conversations
+        already visible in the selected profile remain unaffected.
+        """
+        session_id = _exact_resume_session_id(claude_args)
+        if session_id is None:
+            return
+
+        default_projects = Path.home() / ".claude" / "projects"
+        if _transcript_visibility(default_projects, session_id) is not True:
+            return
+        if (
+            _transcript_visibility(session_dir / "projects", session_id)
+            is not False
+        ):
+            return
+
+        sessions, unreadable = scan_live_sessions(session_dir)
+        retry = (
+            f"Retry `cswap run {account_num} --share-history -- --resume "
+            f"{session_id}` once the profile can finish sharing history."
+        )
+        if sessions:
+            pids = ", ".join(str(session.pid) for session in sessions)
+            reason = (
+                f"another Claude instance is using Account-{account_num}'s "
+                f"session profile (PID {pids})"
+            )
+            recovery = f"Exit that instance first. {retry}"
+        elif unreadable:
+            reason = (
+                f"{unreadable} session record(s) in Account-{account_num}'s "
+                "profile could not be read"
+            )
+            recovery = (
+                f"Inspect {session_dir / 'sessions'}, repair or remove the "
+                f"unreadable record(s), then retry. {retry}"
+            )
+        else:
+            reason = (
+                "shared history could not be activated for the selected profile"
+            )
+            recovery = f"Check the claude-swap log for the sharing error. {retry}"
+
+        raise SessionError(
+            f"Conversation {session_id} exists in ~/.claude, but "
+            f"Account-{account_num} ({email}) cannot see it because {reason}. "
+            f"{recovery}"
+        )
 
     def exec_default(self, claude_args: list[str]) -> NoReturn:
         """Launch plain Claude Code with the current default login.

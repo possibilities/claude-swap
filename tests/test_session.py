@@ -30,7 +30,9 @@ from claude_swap.session import (
     MCP_MIRROR_MARKER,
     SHARE_MANIFEST,
     SessionManager,
+    _exact_resume_session_id,
     _probe_env,
+    _transcript_visibility,
     keychain_service_name,
     profile_is_quiescent,
     read_session_identity,
@@ -263,6 +265,42 @@ class TestHelpers:
         so the predicate is not just refusing everything."""
         make_live(tmp_path, pid=2**22 + 12345)
         assert profile_is_quiescent(tmp_path)
+
+    @pytest.mark.parametrize(
+        ("args", "expected"),
+        [
+            (
+                ["--resume", "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"],
+                "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            ),
+            (
+                ["-r=AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE"],
+                "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            ),
+            (["--resume"], None),
+            (["--resume", "search text"], None),
+            (["--resume", "https://claude.ai/code/session"], None),
+            ([], None),
+        ],
+    )
+    def test_exact_resume_session_id(self, args, expected):
+        assert _exact_resume_session_id(args) == expected
+
+    def test_transcript_visibility_is_tristate(self, tmp_path, monkeypatch):
+        projects = tmp_path / "projects"
+        assert _transcript_visibility(projects, "a" * 36) is False
+        project = projects / "-tmp-project"
+        project.mkdir(parents=True)
+        session_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        (project / f"{session_id}.jsonl").write_text("conversation\n")
+        assert _transcript_visibility(projects, session_id) is True
+
+        monkeypatch.setattr(
+            Path,
+            "iterdir",
+            lambda _self: (_ for _ in ()).throw(OSError()),
+        )
+        assert _transcript_visibility(projects, session_id) is None
 
 
 class TestSessionIdentity:
@@ -1400,6 +1438,89 @@ class TestRun:
         monkeypatch.setattr(session_mod.shutil, "which", lambda name: None)
         with pytest.raises(SessionError, match="not found on PATH"):
             manager.exec_default([])
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="history sharing is POSIX-only"
+    )
+    def test_exact_resume_refused_when_live_profile_defers_shared_history(
+        self, manager, capture_exec, temp_home, monkeypatch
+    ):
+        session_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        default_project = temp_home / ".claude" / "projects" / "-home-user-app"
+        default_project.mkdir(parents=True)
+        (default_project / f"{session_id}.jsonl").write_text("default\n")
+
+        session_dir = session_dir_for(
+            manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        (session_dir / "projects" / "-home-user-app").mkdir(parents=True)
+        (session_dir / "history.jsonl").write_text('{"p": "profile"}\n')
+        make_live(session_dir)
+
+        def prepare(identifier, share, share_history=False):
+            manager._sync_sharing(session_dir, share, share_history)
+            return session_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+
+        monkeypatch.setattr(manager, "setup_session", prepare)
+        monkeypatch.setattr(manager.switcher, "_get_current_account", lambda: None)
+
+        with pytest.raises(SessionError, match="exists in ~/.claude") as exc:
+            manager.run(
+                ACCOUNT_NUM,
+                ["--resume", session_id],
+                share=True,
+                share_history=True,
+            )
+
+        message = str(exc.value)
+        assert "another Claude instance" in message
+        assert str(os.getpid()) in message
+        assert "once the profile can finish sharing history" in message
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="history sharing is POSIX-only"
+    )
+    @pytest.mark.parametrize(
+        "claude_args",
+        [
+            [],
+            ["--resume"],
+            ["--resume", "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"],
+        ],
+    )
+    def test_deferred_history_still_launches_when_resume_is_not_stranded(
+        self, manager, capture_exec, temp_home, monkeypatch, claude_args
+    ):
+        session_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        default_project = temp_home / ".claude" / "projects" / "-home-user-app"
+        default_project.mkdir(parents=True)
+        (default_project / f"{session_id}.jsonl").write_text("default\n")
+
+        session_dir = session_dir_for(
+            manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        profile_project = session_dir / "projects" / "-home-user-app"
+        profile_project.mkdir(parents=True)
+        if len(claude_args) == 2:
+            # Exact resume is allowed when the selected profile already has it.
+            (profile_project / f"{session_id}.jsonl").write_text("profile\n")
+        make_live(session_dir)
+
+        def prepare(identifier, share, share_history=False):
+            manager._sync_sharing(session_dir, share, share_history)
+            return session_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+
+        monkeypatch.setattr(manager, "setup_session", prepare)
+        monkeypatch.setattr(manager.switcher, "_get_current_account", lambda: None)
+
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run(
+                ACCOUNT_NUM,
+                claude_args,
+                share=True,
+                share_history=True,
+            )
+        assert exc.value.argv == ["/fake/bin/claude", *claude_args]
 
 
 class TestExec:
