@@ -345,7 +345,7 @@ class TestAtomicWriteThroughSymlink:
         """The 0700 belongs to cswap's own dir. On the target's parent it
         would narrow a foreign directory, and raise PermissionError when
         that parent cannot be chmod'ed at all."""
-        repo = tmp_path / "repo"; repo.mkdir(mode=0o755)
+        repo = tmp_path / "repo"; repo.mkdir(); repo.chmod(0o755)
         live = tmp_path / "live"; live.mkdir()
         tracked = repo / "settings.json"; tracked.write_text("{}")
         link = live / "settings.json"; link.symlink_to(tracked)
