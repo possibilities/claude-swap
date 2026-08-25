@@ -117,6 +117,11 @@ def _freeze_real_store_specs() -> tuple[tuple[Path, bool], ...]:
         return (
             (_paths.get_backup_root(), True),
             (_paths.get_legacy_backup_root(), True),
+            # Protect the XDG/default Linux store even when this test process
+            # runs on macOS. It may still hold real pre-migration state, and a
+            # leaked test thread must not become able to overwrite it merely
+            # because Platform.detect() selects the legacy macOS root today.
+            (Path.home() / ".local" / "share" / "claude-swap", True),
             (_paths.get_claude_config_home(), False),
             (_paths.get_default_claude_config_home(), False),
             (_paths.get_global_config_path().parent, False),
