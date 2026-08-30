@@ -988,6 +988,7 @@ class UsageStore:
         *,
         respect_plans: bool,
         repair_overslept: bool = False,
+        quarantine_proofs: Iterable[str] = (),
     ) -> dict[str, str]:
         """Atomically win the right to fetch: re-check eligibility and stamp
         a bounded lease in one locked pass, returning slot → fencing id.
@@ -1010,10 +1011,19 @@ class UsageStore:
           ``repair_overslept``, this becomes the non-escalating scheduler mode:
           due plans and stale impossible plans win, but valid future plans do
           not.
+
+        ``quarantine_proofs`` names dead rows for which the caller holds a
+        separately verified credential snapshot. Such a row may win one claim
+        immediately despite its dead-token gate, permanent-auth backoff,
+        freshness, or plan. A live claim still wins, and a non-auth backoff
+        from an earlier proof failure is still respected. The successful
+        fenced :meth:`record` remains the only operation that clears the
+        quarantine.
         """
         nums = list(nums)
         if not nums:
             return {}
+        quarantine_proofs = set(quarantine_proofs)
         now = self.clock()
         won: dict[str, str] = {}
         with self._lock():
@@ -1026,7 +1036,11 @@ class UsageStore:
                 else:
                     assert isinstance(row, dict)
                     if not _row_eligible(
-                        row, now, respect_plans, repair_overslept
+                        row,
+                        now,
+                        respect_plans,
+                        repair_overslept,
+                        quarantine_proof=num in quarantine_proofs,
                     ):
                         continue
                 claim_id = uuid.uuid4().hex
@@ -1183,14 +1197,17 @@ def _num_or_none(value: object) -> float | None:
 
 
 def _row_eligible(
-    row: dict, now: float, respect_plans: bool, repair_overslept: bool = False
+    row: dict,
+    now: float,
+    respect_plans: bool,
+    repair_overslept: bool = False,
+    *,
+    quarantine_proof: bool = False,
 ) -> bool:
     """Fetch eligibility of a stored row, evaluated under the write lock
     (see :meth:`UsageStore.reserve` for the two caller modes)."""
-    if int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES:
-        return False
-    backoff_until = _num_or_none(row.get("backoffUntil"))
-    if backoff_until is not None and now < backoff_until:
+    dead = int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES
+    if dead and not quarantine_proof:
         return False
     if _live_claim(
         _num_or_none(row.get("claimUntil")),
@@ -1198,6 +1215,17 @@ def _row_eligible(
         now,
     ):
         return False
+    backoff_until = _num_or_none(row.get("backoffUntil"))
+    if backoff_until is not None and now < backoff_until:
+        proving_original_auth_failure = (
+            dead
+            and quarantine_proof
+            and row.get("lastError") in PERMANENT_AUTH_ERRORS
+        )
+        if not proving_original_auth_failure:
+            return False
+    if dead and quarantine_proof:
+        return True
     fetched_at = _num_or_none(row.get("fetchedAt"))
     stale = fetched_at is None or (now - fetched_at) > SERVE_TTL_S
     next_poll_at = _num_or_none(row.get("nextPollAt"))

@@ -115,6 +115,19 @@ _FETCH_STAGGER_S = 0.25
 _USAGE_AGE_NOTE_S = poll_policy.SERVE_TTL_S
 
 
+@dataclasses.dataclass(frozen=True)
+class _DeadLineageDisposition:
+    """Collector action for a backup-derived dead-token quarantine.
+
+    A fresh, strictly read session credential is carried as the exact proof
+    bytes the fetch worker must use. Every other disposition is a sentinel
+    and leaves the persisted quarantine untouched.
+    """
+
+    sentinel: str | None
+    proven_session_credentials: str | None = None
+
+
 def _pace_marker(window: dict, fetched_at: float | None) -> str:
     """"  (ahead of pace)" when a weekly window is meaningfully ahead of pace, else ""."""
     result = pace.compute_pace(window, fetched_at=fetched_at)
@@ -4726,7 +4739,10 @@ class ClaudeAccountSwitcher:
         return None
 
     def _fetch_account_usage(
-        self, account_info: tuple[int, str, str, str, bool, str, str]
+        self,
+        account_info: tuple[int, str, str, str, bool, str, str],
+        *,
+        proven_session_credentials: str | None = None,
     ) -> FetchRecord:
         """One network fetch for one account. Never raises."""
         num, email, _, org_uuid, is_active, creds, _alias = account_info
@@ -4736,6 +4752,22 @@ class ClaudeAccountSwitcher:
         # Claude Code's own lock protocol, owner or not).
         if is_active:
             return self._fetch_active_usage(str(num), email, creds, org_uuid)
+
+        # A dead-backup collector may have strictly read and identity-checked a
+        # different, fresh session lineage before it acquired the row claim.
+        # Use those exact bytes read-only. Re-reading through the ordinary
+        # best-effort session helper here would reopen a TOCTOU window: if the
+        # Keychain became unreadable, that helper could fall back to the stale
+        # plaintext seed whose predecessor already earned the quarantine.
+        if proven_session_credentials is not None:
+            outcome = oauth.try_fetch_usage_for_account(
+                str(num), email, proven_session_credentials, is_active=True,
+            )
+            return FetchRecord(
+                usage=outcome.usage,
+                error=outcome.error,
+                retry_after_s=outcome.retry_after_s,
+            )
 
         from claude_swap.session import (
             read_session_credentials,
@@ -4809,7 +4841,10 @@ class ClaudeAccountSwitcher:
         )
 
     def _run_usage_fetches(
-        self, infos: list[tuple[int, str, str, str, bool, str, str]]
+        self,
+        infos: list[tuple[int, str, str, str, bool, str, str]],
+        *,
+        proven_session_credentials: dict[str, str] | None = None,
     ) -> dict[str, FetchRecord]:
         """Fetch the given accounts in parallel, staggering request starts so
         N accounts never hit the endpoint in the same instant."""
@@ -4819,7 +4854,17 @@ class ClaudeAccountSwitcher:
             idx, info = idx_info
             if idx and _FETCH_STAGGER_S:
                 time.sleep(idx * _FETCH_STAGGER_S)
-            return str(info[0]), self._fetch_account_usage(info)
+            num = str(info[0])
+            proof = (
+                proven_session_credentials.get(num)
+                if proven_session_credentials is not None
+                else None
+            )
+            if proof is not None:
+                return num, self._fetch_account_usage(
+                    info, proven_session_credentials=proof
+                )
+            return num, self._fetch_account_usage(info)
 
         with ThreadPoolExecutor() as executor:
             return dict(
@@ -4859,6 +4904,7 @@ class ClaudeAccountSwitcher:
         # (e.g. Fable) resets, matching the poll planner's window view.
         _threshold, models = self._poll_policy_inputs()
         sentinels: dict[str, str] = {}
+        proven_session_credentials: dict[str, str] = {}
         for num, info in info_by_num.items():
             static = self._static_usage_sentinel(info)
             if static is not None:
@@ -4874,7 +4920,16 @@ class ClaudeAccountSwitcher:
             entry = entries[num]
             _i = info_by_num[num]
             if self._entry_token_dead(entry, num, _i[1], _i[5], _i[4]):
-                sentinels[num] = self._dead_lineage_sentinel(num, _i)
+                disposition = self._dead_lineage_disposition(num, _i)
+                if disposition.proven_session_credentials is not None:
+                    # Keep the backup strike until a fenced fetch using these
+                    # exact, strictly read bytes succeeds. UsageStore.record's
+                    # success transaction is the only operation that clears it.
+                    proven_session_credentials[num] = (
+                        disposition.proven_session_credentials
+                    )
+                elif disposition.sentinel is not None:
+                    sentinels[num] = disposition.sentinel
             elif entry.auth_dead_strikes and entry.token_dead():
                 # Struck, but no stored source still matches the condemned
                 # generation — the fingerprint healed the verdict.
@@ -4901,6 +4956,7 @@ class ClaudeAccountSwitcher:
                 identities,
                 respect_plans=True,
                 repair_overslept=True,
+                quarantine_proofs=proven_session_credentials,
             )
         else:
             claims = store.reserve(
@@ -4908,6 +4964,7 @@ class ClaudeAccountSwitcher:
                 identities,
                 respect_plans=False,
                 repair_overslept=scheduled,
+                quarantine_proofs=proven_session_credentials,
             )
         # An expired ACTIVE credential that cannot reach the fetch path (and
         # its locked refresh) this tick — failure backoff, a concurrent
@@ -4928,9 +4985,22 @@ class ClaudeAccountSwitcher:
 
         if claims:
             pre = entries
-            records = self._run_usage_fetches(
-                [info_by_num[num] for num in claims]
-            )
+            claimed_proofs = {
+                num: proven_session_credentials[num]
+                for num in claims
+                if num in proven_session_credentials
+            }
+            fetch_infos = [info_by_num[num] for num in claims]
+            if claimed_proofs:
+                records = self._run_usage_fetches(
+                    fetch_infos,
+                    proven_session_credentials=claimed_proofs,
+                )
+                records = self._fence_session_proof_records(
+                    records, claimed_proofs, info_by_num
+                )
+            else:
+                records = self._run_usage_fetches(fetch_infos)
             plans = self._plans_after_fetch(records, pre, info_by_num)
             accepted = store.record(records, identities, claims, plans)
             accepted_records = {
@@ -4955,6 +5025,38 @@ class ClaudeAccountSwitcher:
             num: with_sentinel(entries[num], sentinels.get(num))
             for num in info_by_num
         }
+
+    def _fence_session_proof_records(
+        self,
+        records: dict[str, FetchRecord],
+        claimed_proofs: dict[str, str],
+        info_by_num: dict[str, tuple],
+    ) -> dict[str, FetchRecord]:
+        """Accept a dead-backup proof only while its profile still owns the slot.
+
+        ``/login`` can repoint a session profile while the usage request is in
+        flight. Even a successful request then proves only the carried
+        credential snapshot, not that this profile remains an alternate owner
+        for the quarantined slot. Re-read identity after every proof result and
+        replace a drifted or unreadable outcome with a sentinel record. The
+        fenced record releases the claim but persists nothing, so the original
+        backup strike remains intact.
+        """
+        from claude_swap.session import read_session_identity
+
+        fenced = dict(records)
+        for num in claimed_proofs:
+            if num not in records:
+                continue
+            info = info_by_num[num]
+            session_dir = self._session_dir(str(info[0]), info[1])
+            try:
+                identity = read_session_identity(session_dir)
+            except Exception:
+                identity = None
+            if identity != (info[1], info[3] or ""):
+                fenced[num] = FetchRecord(sentinel=USAGE_RELOGIN_REQUIRED)
+        return fenced
 
     def _slot_token_dead(self, num: str, email: str) -> bool:
         """Is this slot quarantined as refresh-token-dead, right now?
@@ -5052,40 +5154,63 @@ class ClaudeAccountSwitcher:
             stored_fp=oauth.credential_fingerprint(backup)
         )
 
-    def _dead_lineage_sentinel(self, num: str, info: tuple) -> str:
-        """Name the quarantine a dead stored lineage actually earns.
+    def _dead_lineage_disposition(
+        self, num: str, info: tuple
+    ) -> _DeadLineageDisposition:
+        """Name the quarantine or return exact bytes that can prove it stale.
 
         A matching session profile supersedes the backup: an ``invalid_grant``
         recorded from that consumed backup generation says nothing about the
-        owner-held session lineage. When an idle slot's session profile still
-        holds this account's identity and an expired-but-refreshable OAuth
-        credential, surface it as recoverable (``cswap recover``) rather than
-        falsely demanding a browser re-login.
+        owner-held session lineage. When an idle slot's matching profile holds
+        an expired-but-refreshable OAuth credential, surface it as recoverable
+        (``cswap recover``). When it holds a fresh access token, carry that
+        strict snapshot into a fenced read-only fetch. The backup-derived row
+        quarantine remains persisted until that exact fetch succeeds. Neither
+        case falsely demands a browser re-login.
 
         The ACTIVE slot is excluded: its live credential is the one the strike
         was bound against, so there is no second lineage to appeal to.
         """
         from claude_swap.session import (
-            read_session_credentials,
             read_session_identity,
+            read_session_owner_credentials,
         )
 
         account_num, email, _org_name, org_uuid, is_active, _creds, _alias = info
         if is_active:
-            return USAGE_RELOGIN_REQUIRED
+            return _DeadLineageDisposition(USAGE_RELOGIN_REQUIRED)
         session_dir = self._session_dir(str(account_num), email)
-        session_oauth = oauth.extract_oauth_data(
-            read_session_credentials(session_dir) or ""
-        )
-        if (
+        try:
+            owner_credentials = read_session_owner_credentials(session_dir)
+            session_identity = read_session_identity(session_dir)
+        except Exception:
+            return _DeadLineageDisposition(USAGE_RELOGIN_REQUIRED)
+        if owner_credentials.keychain_unavailable or owner_credentials.degraded:
+            return _DeadLineageDisposition(USAGE_RELOGIN_REQUIRED)
+        credential_snapshot = owner_credentials.value
+        if not isinstance(credential_snapshot, str) or not credential_snapshot:
+            return _DeadLineageDisposition(USAGE_RELOGIN_REQUIRED)
+        session_oauth = oauth.extract_oauth_data(credential_snapshot)
+        access_token = session_oauth.get("accessToken") if session_oauth else None
+        if not (
             session_oauth
-            and session_oauth.get("accessToken")
-            and session_oauth.get("refreshToken")
-            and read_session_identity(session_dir) == (email, org_uuid or "")
-            and oauth.is_oauth_token_expired(session_oauth.get("expiresAt"))
+            and isinstance(access_token, str)
+            and bool(access_token)
+            and session_identity == (email, org_uuid or "")
         ):
-            return USAGE_TOKEN_EXPIRED
-        return USAGE_RELOGIN_REQUIRED
+            return _DeadLineageDisposition(USAGE_RELOGIN_REQUIRED)
+        expires_at = session_oauth.get("expiresAt")
+        if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+            return _DeadLineageDisposition(USAGE_RELOGIN_REQUIRED)
+        try:
+            expired = oauth.is_oauth_token_expired(expires_at)
+        except (OverflowError, ValueError):
+            return _DeadLineageDisposition(USAGE_RELOGIN_REQUIRED)
+        if not expired:
+            return _DeadLineageDisposition(None, credential_snapshot)
+        if session_oauth.get("refreshToken"):
+            return _DeadLineageDisposition(USAGE_TOKEN_EXPIRED)
+        return _DeadLineageDisposition(USAGE_RELOGIN_REQUIRED)
 
     def _plans_after_fetch(
         self,

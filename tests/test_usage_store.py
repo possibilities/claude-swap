@@ -1358,6 +1358,43 @@ class TestReserve:
         assert store.reserve(["1"], IDENT, respect_plans=True) == {}
         assert store.reserve(["1"], IDENT, respect_plans=False) == {}
 
+    def test_quarantine_proof_is_fenced_and_only_overrides_auth_backoff(
+        self, store, clock
+    ):
+        """A verified alternate credential gets one claim, not a free pass.
+
+        The original invalid_grant backoff must not delay its proof. A live
+        claim still fences a concurrent collector, and a failed proof's new
+        transient backoff prevents a tight retry loop while retaining the
+        original dead-token strike.
+        """
+        store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+
+        claims = store.reserve(
+            ["1"],
+            IDENT,
+            respect_plans=True,
+            quarantine_proofs=["1"],
+        )
+        assert set(claims) == {"1"}
+        assert store.reserve(
+            ["1"],
+            IDENT,
+            respect_plans=True,
+            quarantine_proofs=["1"],
+        ) == {}
+
+        assert store.record(
+            {"1": FetchRecord(error="http-401")}, IDENT, claims
+        ) == {"1"}
+        assert store.entries(IDENT)["1"].auth_dead_strikes == 1
+        assert store.reserve(
+            ["1"],
+            IDENT,
+            respect_plans=True,
+            quarantine_proofs=["1"],
+        ) == {}
+
     def test_unknown_row_and_identity_mismatch_win(self, store, clock):
         assert set(store.reserve(["1"], IDENT, respect_plans=True)) == {"1"}
         # Slot reused by a different account: the old row is invisible and

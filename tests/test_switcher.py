@@ -14,7 +14,11 @@ import pytest
 
 from claude_swap import macos_keychain
 from claude_swap import oauth
-from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
+from claude_swap.json_output import (
+    USAGE_FOREIGN_CREDENTIAL,
+    USAGE_RELOGIN_REQUIRED,
+    USAGE_TOKEN_EXPIRED,
+)
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
@@ -3947,7 +3951,8 @@ class TestDeadTokenQuarantine:
         session = _oauth_creds("sk-session", -60)
 
         with patch(
-            "claude_swap.session.read_session_credentials", return_value=session
+            "claude_swap.session.read_session_owner_credentials",
+            return_value=ActiveCredentials(session, False),
         ), patch(
             "claude_swap.session.read_session_identity",
             return_value=("test@example.com", ""),
@@ -3956,6 +3961,219 @@ class TestDeadTokenQuarantine:
 
         assert entries["2"].sentinel == USAGE_TOKEN_EXPIRED
         run.assert_not_called()
+
+    def test_backup_dead_but_fresh_session_owner_fetches_and_clears_quarantine(
+        self, temp_home
+    ):
+        """A dead backup cannot quarantine a different, live owner lineage.
+
+        The matching idle session profile is authoritative. Its fresh access
+        token must reach the ordinary session fetch path, whose successful
+        result proves the account usable and leaves the backup-derived strike
+        cleared. Covering only the expired-profile form misses this branch and
+        strands an already-healthy profile behind ``re-login needed``.
+        """
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        self._make_dead(switcher)
+        info = [(2, "test@example.com", "Org", "", False, self._dead_creds(), "")]
+        session = _oauth_creds("sk-session", 7200)
+
+        with patch(
+            "claude_swap.session.read_session_owner_credentials",
+            return_value=ActiveCredentials(session, False),
+        ), patch(
+            "claude_swap.session.read_session_identity",
+            return_value=("test@example.com", ""),
+        ), patch(
+            "claude_swap.session.read_session_credentials"
+        ) as best_effort_read, patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=oauth.UsageOutcome({"five_hour": {"pct": 1}}),
+        ) as fetch:
+            entries = switcher._collect_usage_entries(info)
+
+        best_effort_read.assert_not_called()
+        fetch.assert_called_once_with(
+            "2", "test@example.com", session, is_active=True
+        )
+        assert entries["2"].sentinel is None
+        assert entries["2"].auth_dead_strikes == 0
+        assert entries["2"].last_good == {"five_hour": {"pct": 1}}
+
+    def test_session_keychain_loss_after_proof_uses_snapshot_and_keeps_strike(
+        self, temp_home
+    ):
+        """A strict proof cannot be swapped for the fallback seed in flight.
+
+        Model the Keychain becoming unreadable after classification: the
+        best-effort reader would now return the stale plaintext seed. The
+        worker must not call it, must fetch the exact strict snapshot, and a
+        failed proof must leave the original backup quarantine in place.
+        """
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        self._make_dead(switcher)
+        info = [(2, "test@example.com", "Org", "", False, self._dead_creds(), "")]
+        session = _oauth_creds("sk-session", 7200)
+        stale_seed = _oauth_creds("sk-stale-seed", 7200)
+
+        with patch(
+            "claude_swap.session.read_session_owner_credentials",
+            return_value=ActiveCredentials(session, False),
+        ), patch(
+            "claude_swap.session.read_session_identity",
+            return_value=("test@example.com", ""),
+        ), patch(
+            "claude_swap.session.read_session_credentials",
+            return_value=stale_seed,
+        ) as best_effort_read, patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=oauth.UsageOutcome(None, error="http-401"),
+        ) as fetch:
+            entries = switcher._collect_usage_entries(info)
+
+        best_effort_read.assert_not_called()
+        fetch.assert_called_once_with(
+            "2", "test@example.com", session, is_active=True
+        )
+        assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
+        assert entries["2"].auth_dead_strikes == 1
+        assert entries["2"].last_error == "http-401"
+        assert entries["2"].last_good is None
+
+    def test_session_identity_drift_during_proof_never_clears_quarantine(
+        self, temp_home
+    ):
+        """A successful A snapshot cannot clear A after the profile becomes B."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        self._make_dead(switcher)
+        info = [(2, "test@example.com", "Org", "", False, self._dead_creds(), "")]
+        session = _oauth_creds("sk-session", 7200)
+        identities = iter([
+            ("test@example.com", ""),
+            ("other@example.com", ""),
+        ])
+
+        with patch(
+            "claude_swap.session.read_session_owner_credentials",
+            return_value=ActiveCredentials(session, False),
+        ), patch(
+            "claude_swap.session.read_session_identity",
+            side_effect=lambda _dir: next(identities),
+        ) as identity_read, patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=oauth.UsageOutcome({"five_hour": {"pct": 7}}),
+        ) as fetch:
+            entries = switcher._collect_usage_entries(info)
+
+        fetch.assert_called_once_with(
+            "2", "test@example.com", session, is_active=True
+        )
+        assert identity_read.call_count == 2
+        assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
+        assert entries["2"].auth_dead_strikes == 1
+        assert entries["2"].last_good is None
+
+    @pytest.mark.parametrize(
+        "access_token",
+        ["", 1, {"token": "sk-session"}],
+        ids=["empty", "integer", "mapping"],
+    )
+    def test_malformed_session_access_token_does_not_authorize_proof(
+        self, temp_home, access_token
+    ):
+        """Only a nonempty string access token can challenge quarantine."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        self._make_dead(switcher)
+        info = [(2, "test@example.com", "Org", "", False, self._dead_creds(), "")]
+        session = json.dumps({"claudeAiOauth": {
+            "accessToken": access_token,
+            "refreshToken": "rt-session",
+            "expiresAt": int((time.time() + 7200) * 1000),
+        }})
+
+        with patch(
+            "claude_swap.session.read_session_owner_credentials",
+            return_value=ActiveCredentials(session, False),
+        ), patch(
+            "claude_swap.session.read_session_identity",
+            return_value=("test@example.com", ""),
+        ), patch.object(switcher, "_run_usage_fetches") as run:
+            entries = switcher._collect_usage_entries(info)
+
+        run.assert_not_called()
+        assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
+        assert entries["2"].auth_dead_strikes == 1
+
+    def test_unreadable_session_keychain_does_not_clear_backup_quarantine(
+        self, temp_home
+    ):
+        """A plaintext seed cannot stand in for an unreadable Keychain item.
+
+        Claude rotates the session lineage in the macOS Keychain while the
+        profile file can remain a consumed predecessor. The best-effort reader
+        deliberately falls back to that seed; quarantine decisions must use
+        the strict owner read and preserve the strike when it is unavailable.
+        """
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        self._make_dead(switcher)
+        info = [(2, "test@example.com", "Org", "", False, self._dead_creds(), "")]
+        stale_seed = _oauth_creds("sk-stale-seed", 7200)
+
+        with patch(
+            "claude_swap.session.read_session_owner_credentials",
+            return_value=ActiveCredentials(None, True),
+        ), patch(
+            "claude_swap.session.read_session_credentials", return_value=stale_seed
+        ), patch(
+            "claude_swap.session.read_session_identity",
+            return_value=("test@example.com", ""),
+        ), patch.object(switcher, "_run_usage_fetches") as run:
+            entries = switcher._collect_usage_entries(info)
+
+        run.assert_not_called()
+        assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
+        assert entries["2"].auth_dead_strikes == 1
+
+    @pytest.mark.parametrize(
+        "expires_at",
+        [None, "tomorrow", True, float("nan"), float("inf")],
+        ids=["null", "string", "boolean", "nan", "infinity"],
+    )
+    def test_unverifiable_session_expiry_does_not_clear_backup_quarantine(
+        self, temp_home, expires_at
+    ):
+        """Only an explicit finite numeric expiry can prove local freshness."""
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        self._make_dead(switcher)
+        info = [(2, "test@example.com", "Org", "", False, self._dead_creds(), "")]
+        session = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-session",
+            "refreshToken": "rt-session",
+            "expiresAt": expires_at,
+        }})
+
+        with patch(
+            "claude_swap.session.read_session_owner_credentials",
+            return_value=ActiveCredentials(session, False),
+        ), patch(
+            "claude_swap.session.read_session_identity",
+            return_value=("test@example.com", ""),
+        ), patch.object(switcher, "_run_usage_fetches") as run:
+            entries = switcher._collect_usage_entries(info)
+
+        run.assert_not_called()
+        assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
+        assert entries["2"].auth_dead_strikes == 1
 
     def test_dead_backup_with_unreadable_session_identity_stays_relogin_required(
         self, temp_home
@@ -3969,7 +4187,8 @@ class TestDeadTokenQuarantine:
         session = _oauth_creds("sk-session", -60)
 
         with patch(
-            "claude_swap.session.read_session_credentials", return_value=session
+            "claude_swap.session.read_session_owner_credentials",
+            return_value=ActiveCredentials(session, False),
         ), patch(
             "claude_swap.session.read_session_identity", return_value=None
         ):
