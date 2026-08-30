@@ -4,14 +4,14 @@
 
 Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out, or let it switch for you before you hit a rate limit. Track usage for every account in a live dashboard, and run accounts in parallel. Works with both the Claude Code CLI and the VS Code extension.
 
-This repository is the public `possibilities` integration fork. Its `main`
-tracks upstream and also carries the capacity metadata and expired-token
-recovery contracts consumed by
-[`agentusage`](https://github.com/possibilities/agentusage). Install this fork
-explicitly when you need those contracts:
+This repository is the public `possibilities` fork. Its `main` branch is an
+exact mirror of upstream. The published `integration` branch composes the
+capacity metadata, expired-token recovery, and other downstream contracts
+consumed by [`agentusage`](https://github.com/possibilities/agentusage).
+Install that branch explicitly when you need those contracts:
 
 ```bash
-uv tool install --force 'git+https://github.com/possibilities/claude-swap.git@main'
+uv tool install --force 'git+https://github.com/possibilities/claude-swap.git@integration'
 ```
 
 ## Installation
@@ -33,6 +33,7 @@ pipx install claude-swap
 ```bash
 git clone https://github.com/possibilities/claude-swap.git
 cd claude-swap
+git switch integration
 uv sync
 uv run cswap help
 ```
